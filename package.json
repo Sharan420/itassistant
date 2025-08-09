@@ -21,6 +21,10 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "concurrently \"npm run dev --workspace=BackEnd\" \"npm run dev --workspace=FrontEnd\""
+  },
+  "dependencies": {
+    "concurrently": "^9.2.0"
   }
 }
