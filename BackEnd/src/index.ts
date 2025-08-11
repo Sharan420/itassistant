@@ -13,7 +13,7 @@ app.get("/", (_req, res) => {
 app.post("/api/chat", async (req, res) => {
   const { query, history } = req.body;
   console.log(query);
-  const response = await fetch("http://localhost:8000/it-assistant-v2", {
+  const response = await fetch("http://localhost:8000/it-assistant", {
     method: "POST",
     body: JSON.stringify({ query: query, history: history }),
     headers: {

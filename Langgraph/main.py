@@ -90,6 +90,13 @@ def knowledge_base_retriever(query: str) -> str:
         ]
 
         results = list(collection.aggregate(pipeline))
+        # Debug print of fetched KB results
+        try:
+            print(f"KB search returned {len(results)} result(s) for query: {query}")
+            if results:
+                print("KB top document (raw):", results[0])
+        except Exception:
+            pass
         if not results:
             return "No relevant knowledge base entries were found. Please rephrase your question."
 
@@ -130,6 +137,9 @@ class QueryClassification(PydanticBaseModel):
 
 class RelevanceDecision(PydanticBaseModel):
     decision: Literal["relevant", "irrelevant"]
+
+class KBAnswer(PydanticBaseModel):
+    answer: str
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
@@ -310,8 +320,9 @@ def kb_relevance_router(state: AgentState):
         return "no_knowledge_response"
 
     prompt = (
-        "Decide if the provided knowledge base content is relevant to the user's query. "
-        "Return strictly one of: relevant, irrelevant. Do not use markdown syntax.\n\n"
+        "You are a strict relevance judge. Decide if the provided knowledge base content directly answers the user's query. "
+        "Return strictly one of: relevant, irrelevant. Be conservative: if unsure, return 'irrelevant'. "
+        "Do not use markdown syntax.\n\n"
         f"User Query:\n{original_query}\n\nKB Content:\n{kb_context}"
     )
     relevance_chain = llm.with_structured_output(RelevanceDecision)
@@ -330,23 +341,36 @@ def no_knowledge_response_node(state: AgentState):
     return {"messages": [AIMessage(content="No Knowledge Stored")]}
 
 def kb_llm_response_node(state: AgentState):
-    """Generate LLM response using KB context and chat history."""
+    """Generate LLM response using KB context and chat history, with strict KB-only policy."""
     original_query = state.get("original_query", "")
     kb_context = state.get("kb_context", "")
-    history_messages = state.get("messages", [])
-    
-    system_prompt = (
-        "You are an IT assistant. Do not use markdown syntax for replies. "
-        "Use the following knowledge base information to answer the user's question. "
-        "Be helpful and provide a clear response based on the available information. "
-        "Do not mention sources. Only provide straight resolutions.\n\n"
-        f"Knowledge Base Context:\n{kb_context}"
+    history_messages: List[BaseMessage] = state.get("messages", []) or []
+
+    # Compact textual history for additional context without enabling extra knowledge
+    history_lines: List[str] = []
+    for msg in history_messages[-6:]:
+        role = "user" if isinstance(msg, HumanMessage) else ("assistant" if isinstance(msg, AIMessage) else "system")
+        history_lines.append(f"{role}: {str(msg.content)}")
+    history_text = "\n".join(history_lines)
+
+    prompt = (
+        "You are an IT assistant. Do not use markdown syntax.\n"
+        "Rewrite an answer STRICTLY using ONLY the provided knowledge base content.\n"
+        "- Do NOT add any information that is not present in the KB content.\n"
+        "- If the KB content does not contain enough information to answer, output exactly: No Knowledge Stored\n"
+        "- Provide a concise resolution-only answer.\n\n"
+        f"Conversation history (may contain prior context; do NOT introduce new info beyond KB):\n{history_text}\n\n"
+        f"User Query:\n{original_query}\n\n"
+        f"Knowledge Base Content:\n{kb_context}\n\n"
+        "Return the final answer text."
     )
-    
-    # Use prior chat history plus new system + user messages
-    messages = [*history_messages, SystemMessage(content=system_prompt), HumanMessage(content=original_query)]
-    response = llm.invoke(messages)  # Use regular LLM without tools for informational responses
-    return {"messages": [response]}
+
+    chain = llm.with_structured_output(KBAnswer)
+    result = chain.invoke(prompt)
+    answer_text = result.answer.strip() if hasattr(result, "answer") else str(result).strip()
+    if not answer_text:
+        answer_text = "No Knowledge Stored"
+    return {"messages": [AIMessage(content=answer_text)]}
 
 def tool_router(state: AgentState):
     """Route tool queries - if no tools requested, ask for missing inputs."""
