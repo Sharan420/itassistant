@@ -49,6 +49,7 @@ def get_embeddings():
 @tool
 def password_reset_tool(email: str) -> str:
     """Send a password reset link to the given email address. If no email is provided, ask the user for their email address."""
+    print(f"Password reset tool called with email: {email}")
     return f"A password reset link has been sent to {email}."
 
 @tool
@@ -119,12 +120,16 @@ def knowledge_base_retriever(query: str) -> str:
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
-    query_type: str = None
-    kb_context: str = None
-    original_query: str = None
+    query_type: str | None
+    kb_context: str | None
+    original_query: str | None
+    history_used: bool | None
 
 class QueryClassification(PydanticBaseModel):
-    classification: Literal["tool_available", "not_available"]
+    classification: Literal["tool_available", "tools_not_available", "tools_not_required"]
+
+class RelevanceDecision(PydanticBaseModel):
+    decision: Literal["relevant", "irrelevant"]
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
@@ -136,52 +141,86 @@ llm_with_tools = llm.bind_tools(tools)
 tool_node = ToolNode(tools)
 
 def classify_query_node(state: AgentState):
-    """Classify user query as actionable or informational."""
-    # Get the original user query
+    """Classify user query as: tool_available | tools_not_available | tools_not_required."""
+    # Get the original user query (most recent human message)
     original_query = None
-    for msg in reversed(state["messages"]):
+    last_human_index = None
+    for idx, msg in enumerate(reversed(state["messages"])):
         if isinstance(msg, HumanMessage):
             original_query = msg.content
+            last_human_index = len(state["messages"]) - 1 - idx
             break
     
     if not original_query:
-        return {"query_type": "informational", "original_query": ""}
+        return {"query_type": "tools_not_required", "original_query": ""}
     
     # Deterministic classification for common actionable patterns
     query_lower = original_query.lower()
     password_keywords = ["password", "reset", "forgot", "change", "unlock", "account"]
+
+    # Helper: did a recent prior user message express password reset intent?
+    prior_password_intent = False
+    if last_human_index is not None:
+        for prior_msg in reversed(state["messages"][:last_human_index]):
+            if isinstance(prior_msg, HumanMessage):
+                text = str(prior_msg.content).lower()
+                if ("password" in text) and ("reset" in text or "forgot" in text):
+                    prior_password_intent = True
+                    break
     
     # Check for password-related requests (tool available)
-    if any(keyword in query_lower for keyword in ["reset", "forgot"]) and "password" in query_lower:
+    if (any(keyword in query_lower for keyword in ["reset", "forgot"]) and "password" in query_lower) or prior_password_intent:
         print(f"Query Classification: tool_available (password reset tool)")
         return {
             "query_type": "tool_available",
             "original_query": original_query
         }
     
-    # Check for other tool-available patterns
-    # Currently we only have password_reset_tool, so only password-related queries have tools
-    # Future: Add more patterns when more tools are available
+    # Check for other action requests we DO NOT have tools for
+    unavailable_action_patterns = [
+        ("unlock", "account"),
+        ("change", "password"),
+        ("disable", "account"),
+        ("enable", "account"),
+        ("create", "account")
+    ]
+    for pattern in unavailable_action_patterns:
+        if all(word in query_lower for word in pattern):
+            print("Query Classification: tools_not_available (no matching tool)")
+            return {
+                "query_type": "tools_not_available",
+                "original_query": original_query
+            }
+
+    # Heuristic: greetings / small talk / general statements → tools_not_required
+    general_patterns = [
+        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+        "how are you", "what's up", "test", "testing"
+    ]
+    if any(p in query_lower for p in general_patterns):
+        print("Query Classification: tools_not_required (general query)")
+        return {"query_type": "tools_not_required", "original_query": original_query}
     
     # Fallback to LLM classification
-    classification_prompt = f"""Classify this user query as either 'tool_available' or 'not_available':
+    classification_prompt = f"""Classify the user query into exactly one of:
 
-tool_available: A specific tool can handle this request (currently only password reset)
-informational: No specific tool available, needs knowledge base or general response
+- tool_available: A specific tool can execute this request. Currently only password resets are supported.
+- tools_not_available: The user requests an action we cannot execute via tools (e.g., account unlock, password change).
+- tools_not_required: The user is asking for information, guidance, or a general message (greetings, small talk, how-to).
 
 Available Tools:
-- password_reset_tool: For resetting user passwords
+- password_reset_tool: For sending a password reset link given an email.
 
 Examples:
 - "Reset my password" → tool_available
 - "Please reset my password" → tool_available
 - "I forgot my password" → tool_available
-- "Change my password" → not_available (no tool for password changes)
-- "Unlock my account" → not_available (no account unlock tool)
-- "How do I connect to VPN?" → not_available
-- "What is the WiFi password?" → not_available
-- "Hello" → not_available
-- "How to reset password?" → not_available (asking how, not requesting action)
+- "Change my password" → tools_not_available
+- "Unlock my account" → tools_not_available
+- "How do I connect to VPN?" → tools_not_required
+- "What is the WiFi password?" → tools_not_required
+- "Hello" → tools_not_required
+- "How to reset password?" → tools_not_required
 
 Query: {original_query}"""
     
@@ -196,11 +235,12 @@ Query: {original_query}"""
 
 def classification_router(state: AgentState):
     """Route based on query classification."""
-    query_type = state.get("query_type", "not_available")
+    query_type = state.get("query_type", "tools_not_required")
     if query_type == "tool_available":
         return "tool_flow"
-    else:
-        return "kb_flow"
+    if query_type == "tools_not_available":
+        return "capability_limited"
+    return "kb_flow"
 
 def tool_agent_node(state: AgentState):
     """Handle queries that have specific tools available."""
@@ -222,7 +262,9 @@ def tool_agent_node(state: AgentState):
             "Do not use markdown syntax."
         )
     
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=original_query)]
+    # Include full prior history to let the model infer missing details from context
+    history_messages = state.get("messages", [])
+    messages = [*history_messages, SystemMessage(content=system_prompt), HumanMessage(content=original_query)]
     
     # Use dedicated LLM instance for tool usage with higher temperature
     tool_llm = ChatGoogleGenerativeAI(
@@ -241,7 +283,7 @@ def tool_agent_node(state: AgentState):
     return {"messages": [response]}
 
 def kb_search_node(state: AgentState):
-    """Search knowledge base for informational queries."""
+    """Search knowledge base for tools_not_required queries."""
     original_query = state.get("original_query", "")
     
     if not original_query:
@@ -254,40 +296,55 @@ def kb_search_node(state: AgentState):
     except Exception as e:
         return {"kb_context": f"Knowledge base error: {str(e)}"}
 
-def kb_router(state: AgentState):
-    """Route based on KB search results."""
+def kb_relevance_router(state: AgentState):
+    """Use LLM to judge if KB context is relevant to the query; route accordingly."""
     kb_context = state.get("kb_context", "")
-    
-    # Check if KB found relevant results
+    original_query = state.get("original_query", "")
+
+    # Quick negative checks
     if ("No relevant knowledge base entries were found" in kb_context or 
         "Knowledge base search error" in kb_context or
         "Knowledge base is not configured" in kb_context or
         not kb_context or kb_context.strip() == ""):
-        print("KB Router: No relevant KB results, sending fallback message")
+        print("KB Relevance: No KB content to evaluate → no_knowledge_response")
         return "no_knowledge_response"
-    else:
-        print("KB Router: Found KB results, generating LLM response with context")
+
+    prompt = (
+        "Decide if the provided knowledge base content is relevant to the user's query. "
+        "Return strictly one of: relevant, irrelevant. Do not use markdown syntax.\n\n"
+        f"User Query:\n{original_query}\n\nKB Content:\n{kb_context}"
+    )
+    relevance_chain = llm.with_structured_output(RelevanceDecision)
+    decision = relevance_chain.invoke(prompt)
+    print(f"KB Relevance decision: {decision.decision}")
+    if decision.decision == "relevant":
         return "kb_llm_response"
+    return "no_knowledge_response"
+
+def capability_limited_node(state: AgentState):
+    """Respond that tools are not available for this request."""
+    return {"messages": [AIMessage(content="Currently Out of my capability")]}
 
 def no_knowledge_response_node(state: AgentState):
-    """Return fallback message when no knowledge is available."""
-    response_msg = AIMessage(content="I cannot help with that query please contact an Admin")
-    return {"messages": [response_msg]}
+    """Return fixed message when no relevant KB is found. Do not generate new content."""
+    return {"messages": [AIMessage(content="No Knowledge Stored")]}
 
 def kb_llm_response_node(state: AgentState):
-    """Generate LLM response using KB context."""
+    """Generate LLM response using KB context and chat history."""
     original_query = state.get("original_query", "")
     kb_context = state.get("kb_context", "")
+    history_messages = state.get("messages", [])
     
     system_prompt = (
-        "Do not mention sources. Only straight resolutions. Do not use markdown syntax for replies."
-        "You are an IT assistant. Use the following knowledge base information "
-        "to answer the user's question. Be helpful and provide a clear response "
-        "based on the available information.\n\n"
+        "You are an IT assistant. Do not use markdown syntax for replies. "
+        "Use the following knowledge base information to answer the user's question. "
+        "Be helpful and provide a clear response based on the available information. "
+        "Do not mention sources. Only provide straight resolutions.\n\n"
         f"Knowledge Base Context:\n{kb_context}"
     )
     
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=original_query)]
+    # Use prior chat history plus new system + user messages
+    messages = [*history_messages, SystemMessage(content=system_prompt), HumanMessage(content=original_query)]
     response = llm.invoke(messages)  # Use regular LLM without tools for informational responses
     return {"messages": [response]}
 
@@ -322,7 +379,9 @@ def missing_inputs_node(state: AgentState):
             "Do not use markdown syntax. Be direct and helpful."
         )
     
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=original_query)]
+    # Include history for continuity
+    history_messages = state.get("messages", [])
+    messages = [*history_messages, SystemMessage(content=system_prompt), HumanMessage(content=original_query)]
     
     # Use regular LLM without tools for asking for inputs
     response = llm.invoke(messages)
@@ -337,6 +396,7 @@ graph_builder.add_node("missing_inputs", missing_inputs_node)
 graph_builder.add_node("kb_search", kb_search_node)
 graph_builder.add_node("kb_llm_response", kb_llm_response_node)
 graph_builder.add_node("no_knowledge_response", no_knowledge_response_node)
+graph_builder.add_node("capability_limited", capability_limited_node)
 graph_builder.add_node("call_tools", tool_node)
 
 # Entry point: classify the query first
@@ -348,7 +408,8 @@ graph_builder.add_conditional_edges(
     classification_router,
     {
         "tool_flow": "tool_agent",
-        "kb_flow": "kb_search"
+        "kb_flow": "kb_search",
+        "capability_limited": "capability_limited"
     }
 )
 
@@ -368,10 +429,10 @@ graph_builder.add_edge("call_tools", END)
 # Missing inputs response ends the flow
 graph_builder.add_edge("missing_inputs", END)
 
-# Informational flow: route based on KB results
+# Informational flow: route based on KB relevance (LLM-judged)
 graph_builder.add_conditional_edges(
     "kb_search",
-    kb_router,
+    kb_relevance_router,
     {
         "kb_llm_response": "kb_llm_response",
         "no_knowledge_response": "no_knowledge_response"
@@ -381,6 +442,7 @@ graph_builder.add_conditional_edges(
 # Both KB responses end the flow
 graph_builder.add_edge("kb_llm_response", END)
 graph_builder.add_edge("no_knowledge_response", END)
+graph_builder.add_edge("capability_limited", END)
 
 runnable_graph = graph_builder.compile()
 
@@ -473,6 +535,238 @@ async def add_knowledge(request: AddKnowledgeRequest):
             success=False,
             message=f"Error adding document to knowledge base: {str(e)}"
         )
+
+# ==========================
+# PSEUDOCODE GRAPH IMPLEMENTATION (v2)
+# ==========================
+
+# State for v2 graph
+class PState(TypedDict):
+    messages: Annotated[List[BaseMessage], lambda x, y: x + y]
+    route: Literal["tool", "kb"] | None
+    slots: dict | None
+    missing_fields: List[str] | None
+    kb_context: str | None
+    relevant: bool | None
+
+
+def p_context_collector_node(state: PState):
+    history_messages: List[BaseMessage] = state.get("messages", []) or []
+    # Extract last human query
+    user_text = ""
+    for msg in reversed(history_messages):
+        if isinstance(msg, HumanMessage):
+            user_text = str(msg.content)
+            break
+    # Simple slot extraction from history (email if present)
+    email_value: str | None = None
+    for msg in reversed(history_messages):
+        if isinstance(msg, HumanMessage):
+            text = str(msg.content)
+            # Very lightweight pattern capture; LLM will still drive slot decisions
+            if "@" in text and "." in text and len(text) <= 128:
+                email_value = text.strip()
+                break
+    slots = state.get("slots") or {}
+    if email_value:
+        slots["email"] = email_value
+    return {
+        "messages": [],
+        "slots": slots,
+    }
+
+
+class PRoute(PydanticBaseModel):
+    route: Literal["tool", "kb"]
+
+
+def p_intent_classifier_node(state: PState):
+    # Decide route using last human message plus recent history context
+    history_messages: List[BaseMessage] = state.get("messages", []) or []
+    last_human = next((m for m in reversed(history_messages) if isinstance(m, HumanMessage)), None)
+    last_text = (last_human.content if last_human else "").lower()
+
+    # Heuristics: password reset → tool, else kb
+    tool_intent = ("password" in last_text) and ("reset" in last_text or "forgot" in last_text)
+    if not tool_intent:
+        # Check earlier human messages for tool intent
+        for msg in reversed(history_messages):
+            if isinstance(msg, HumanMessage):
+                t = str(msg.content).lower()
+                if ("password" in t) and ("reset" in t or "forgot" in t):
+                    tool_intent = True
+                    break
+
+    if tool_intent:
+        route = "tool"
+    else:
+        # Non-tool queries route to KB
+        route = "kb"
+
+    # Determine missing fields for known tool intents
+    slots = state.get("slots") or {}
+    missing_fields: List[str] = []
+    if route == "tool":
+        if not slots.get("email"):
+            missing_fields.append("email")
+
+    return {
+        "route": route,
+        "missing_fields": missing_fields,
+    }
+
+
+def p_tool_execution_node(state: PState):
+    # If missing fields, let router send to slot filler
+    missing = state.get("missing_fields") or []
+    if missing:
+        return {"messages": []}
+
+    # Execute tool using slots
+    slots = state.get("slots") or {}
+    email = slots.get("email")
+    if not email:
+        # Safety guard; ask user for email
+        ask = AIMessage(content="Please provide your email address to proceed with password reset.")
+        return {"messages": [ask], "missing_fields": ["email"]}
+
+    result_text = password_reset_tool.invoke({"email": email}) if hasattr(password_reset_tool, "invoke") else password_reset_tool(email)
+    return {"messages": [AIMessage(content=str(result_text))]}
+
+
+def p_slot_filler_node(state: PState):
+    # Ask for any missing fields
+    missing = state.get("missing_fields") or []
+    if not missing:
+        return {"messages": []}
+    prompt_parts = ["I need the following information to proceed:"]
+    for f in missing:
+        if f == "email":
+            prompt_parts.append("- Your email address")
+        else:
+            prompt_parts.append(f"- {f}")
+    prompt_parts.append("Please reply with the missing details.")
+    content = "\n".join(prompt_parts)
+    return {"messages": [AIMessage(content=content)]}
+
+
+def p_kb_retrieval_node(state: PState):
+    history_messages: List[BaseMessage] = state.get("messages", []) or []
+    last_human = next((m for m in reversed(history_messages) if isinstance(m, HumanMessage)), None)
+    query_text = last_human.content if last_human else ""
+    try:
+        kb_result = knowledge_base_retriever.invoke({"query": query_text})
+    except Exception as e:
+        kb_result = f"Knowledge base error: {e}"
+    return {"kb_context": kb_result}
+
+
+class PRelevance(PydanticBaseModel):
+    decision: Literal["relevant", "irrelevant"]
+
+
+def p_relevancy_checker_node(state: PState):
+    kb_context = state.get("kb_context") or ""
+    history_messages: List[BaseMessage] = state.get("messages", []) or []
+    last_human = next((m for m in reversed(history_messages) if isinstance(m, HumanMessage)), None)
+    query_text = last_human.content if last_human else ""
+    # Quick negatives
+    if ("No relevant knowledge base entries were found" in kb_context or
+        "Knowledge base search error" in kb_context or
+        "Knowledge base is not configured" in kb_context or
+        not kb_context.strip()):
+        return {"relevant": False}
+    prompt = (
+        "Return strictly one of: relevant, irrelevant. Do not use markdown syntax.\n\n"
+        f"User Query:\n{query_text}\n\nKB Content:\n{kb_context}"
+    )
+    chain = llm.with_structured_output(PRelevance)
+    dec = chain.invoke(prompt)
+    return {"relevant": dec.decision == "relevant"}
+
+
+def p_kb_response_node(state: PState):
+    history_messages: List[BaseMessage] = state.get("messages", []) or []
+    last_human = next((m for m in reversed(history_messages) if isinstance(m, HumanMessage)), None)
+    query_text = last_human.content if last_human else ""
+    kb_context = state.get("kb_context") or ""
+    sys = (
+        "Do not use markdown syntax. You are an IT assistant. Use the provided knowledge context to answer. "
+        "Be concise and provide a clear resolution only.\n\n"
+        f"Knowledge Context:\n{kb_context}"
+    )
+    messages = [*history_messages, SystemMessage(content=sys), HumanMessage(content=query_text)]
+    resp = llm.invoke(messages)
+    return {"messages": [resp]}
+
+
+# Build v2 graph
+p_builder = StateGraph(PState)
+p_builder.add_node("context_collector", p_context_collector_node)
+p_builder.add_node("intent_classifier", p_intent_classifier_node)
+p_builder.add_node("tool_execution", p_tool_execution_node)
+p_builder.add_node("slot_filler", p_slot_filler_node)
+p_builder.add_node("kb_retrieval", p_kb_retrieval_node)
+p_builder.add_node("relevancy_checker", p_relevancy_checker_node)
+p_builder.add_node("kb_response", p_kb_response_node)
+p_builder.add_node("no_knowledge", lambda s: {"messages": [AIMessage(content="No Knowledge Stored")]})
+
+p_builder.set_entry_point("context_collector")
+
+# context_collector -> intent_classifier
+p_builder.add_edge("context_collector", "intent_classifier")
+
+# intent_classifier conditional to tool or kb
+def _route_picker(state: PState):
+    return state.get("route", "kb")
+
+p_builder.add_conditional_edges(
+    "intent_classifier",
+    _route_picker,
+    {"tool": "tool_execution", "kb": "kb_retrieval"},
+)
+
+# Tool side: if missing_fields then slot_filler else END
+def _tool_router(state: PState):
+    return "slot_filler" if (state.get("missing_fields") or []) else END
+
+p_builder.add_conditional_edges(
+    "tool_execution",
+    _tool_router,
+    {"slot_filler": "slot_filler", END: END},
+)
+# Slot filler ends (wait for user to supply info in next turn)
+p_builder.add_edge("slot_filler", END)
+
+# KB side
+p_builder.add_edge("kb_retrieval", "relevancy_checker")
+
+def _relevance_router(state: PState):
+    return "kb_response" if state.get("relevant") else "no_knowledge"
+
+p_builder.add_conditional_edges(
+    "relevancy_checker",
+    _relevance_router,
+    {"kb_response": "kb_response", "no_knowledge": "no_knowledge"},
+)
+
+p_builder.add_edge("kb_response", END)
+p_builder.add_edge("no_knowledge", END)
+
+runnable_graph_v2 = p_builder.compile()
+
+
+# Optional: second endpoint using v2 graph
+@app.post("/it-assistant-v2", response_model=QueryResponse)
+async def process_query_v2(request: QueryRequest):
+    system_policy = (
+        "You are an IT assistant. Do not use markdown syntax. Respond succinctly and factually."
+    )
+    inputs = {"messages": [SystemMessage(content=system_policy), HumanMessage(content=request.query)]}
+    final_state = runnable_graph_v2.invoke(inputs, config={"recursion_limit": 6})
+    response_message = final_state["messages"][ -1 ].content
+    return QueryResponse(response=response_message)
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="localhost", port=8000)
