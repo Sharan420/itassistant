@@ -1,0 +1,12 @@
+[project]
+name = "itassistant-langgraph"
+version = "1.0.0"
+description = "IT Assistant LangGraph Backend"
+requires-python = ">=3.11.13"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.python]
+version = "3.11.13"
