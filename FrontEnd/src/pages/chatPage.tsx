@@ -63,7 +63,7 @@ export default function ChatPage() {
     try {
       console.log(values.message);
       const response = await fetch(
-        `${import.meta.env.VITE_API_URL_BASE}/api/chat`,
+        `${import.meta.env.VITE_API_URL_BASE}/chat/query`,
         {
           method: "POST",
           headers: {
@@ -77,7 +77,7 @@ export default function ChatPage() {
         ...prevMessages,
         {
           id: prevMessages.length + 1,
-          text: data.response,
+          text: data.answer || "Sorry, I couldn't process your request.",
           sender: "assistant",
         },
       ]);
