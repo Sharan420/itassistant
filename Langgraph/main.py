@@ -1,7 +1,5 @@
 import os
-import json
-from typing import Optional, Any, Dict, List
-import numpy as np
+from typing import Optional, Dict, List, Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -36,7 +34,7 @@ if not GOOGLE_API_KEY:
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-app = FastAPI(title="DBChat API", version="1.0.0")
+app = FastAPI(title="Netflix DB Chat API", version="1.0.0")
 
 # Add CORS middleware
 app.add_middleware(
@@ -52,30 +50,6 @@ engine = create_engine(POSTGRES_URI, pool_pre_ping=True)
 db = SQLDatabase.from_uri(POSTGRES_URI)
 query_tool = _QuerySQLTool(db=db)
 
-def _get_embedding(text: str) -> List[float]:
-    """Get embedding from Gemini model."""
-    try:
-        # Generate embedding using the text-embedding-001 model
-        result = genai.embed_content(
-            model="embedding-001",
-            content=text,
-            task_type="retrieval_document",  # or "retrieval_query" for queries
-        )
-        # Get the embedding values (automatically normalized)
-        values = result["embedding"]
-        # Ensure we have exactly 3072 dimensions
-        if len(values) < 3072:
-            values.extend([0.0] * (3072 - len(values)))
-        elif len(values) > 3072:
-            values = values[:3072]
-        return values
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {str(e)}")
-
-class KBItem(BaseModel):
-    content: str
-    metadata: Optional[Dict[str, Any]] = None
-
 class ChatMessage(BaseModel):
     id: int
     text: str
@@ -85,63 +59,9 @@ class ChatQuery(BaseModel):
     query: str
     history: Optional[List[ChatMessage]] = None
 
-@app.post("/kb/add")
-def add_to_knowledgebase(item: KBItem) -> Dict[str, Any]:
-    try:
-        # Generate embedding for the content
-        embedding = _get_embedding(item.content)
-        
-        with engine.begin() as conn:
-            result = conn.execute(
-                text(
-                    """
-                    INSERT INTO knowledge_base (content, metadata, embedding)
-                    VALUES (:content, CAST(:metadata AS JSONB), :embedding)
-                    RETURNING id
-                    """
-                ),
-                {
-                    "content": item.content,
-                    "metadata": json.dumps(item.metadata) if item.metadata is not None else None,
-                    "embedding": embedding,
-                },
-            )
-            new_id = result.scalar_one()
-        return {"id": int(new_id), "status": "ok"}
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to insert knowledge: {str(e)}")
+class BasicChatRequest(BaseModel):
+    chat: str
 
-@app.get("/kb/entries")
-def get_all_kb_entries() -> Dict[str, Any]:
-    """Get all knowledge base entries."""
-    try:
-        with engine.begin() as conn:
-            result = conn.execute(
-                text(
-                    """
-                    SELECT id, content, metadata, created_at
-                    FROM knowledge_base
-                    ORDER BY created_at DESC
-                    """
-                )
-            ).fetchall()
-            
-        entries = []
-        for row in result:
-            entries.append({
-                "id": row.id,
-                "content": row.content,
-                "metadata": row.metadata,
-                "created_at": row.created_at.isoformat() if row.created_at else None
-            })
-            
-        return {
-            "entries": entries,
-            "count": len(entries),
-            "status": "ok"
-        }
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve knowledge entries: {str(e)}")
 
 def _extract_text_content(response) -> str:
     """Extract text from Gemini response."""
@@ -163,55 +83,25 @@ def _strip_sql_fences(sql_text: str) -> str:
         cleaned = cleaned.split("\n```")[0]
     return cleaned.strip().rstrip(";")
 
+@app.post("/chat/basic")
+def basic_chat(request: BasicChatRequest) -> Dict[str, Any]:
+    """Basic LLM chat endpoint that takes a chat message and returns a response."""
+    try:
+        # Generate response using the Gemini model
+        response = model.generate_content(request.chat)
+        response_text = _extract_text_content(response)
+        
+        return {
+            "response": response_text
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate response: {str(e)}")
+
 @app.post("/chat/query")
 def process_chat_query(body: ChatQuery) -> Dict[str, Any]:
     user_query = body.query.strip()
     if not user_query:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
-
-    # Get embedding for the query
-    try:
-        query_embedding = _get_embedding(user_query)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate query embedding: {str(e)}")
-
-    # Find relevant knowledge using vector similarity
-    try:
-        with engine.begin() as conn:
-            similar_docs = conn.execute(
-                text(
-                    """
-                    SELECT content, metadata, 1 - (embedding <=> :query_embedding) as similarity
-                    FROM knowledge_base
-                    WHERE embedding IS NOT NULL
-                    ORDER BY embedding <=> :query_embedding
-                    LIMIT 5
-                    """
-                ),
-                {"query_embedding": f"[{','.join(map(str, query_embedding))}]"}
-            ).fetchall()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to search similar documents: {str(e)}")
-
-    # Check if we have relevant knowledge (similarity threshold)
-    SIMILARITY_THRESHOLD = 0.8  # Adjust this value as needed
-    relevant_docs = [doc for doc in similar_docs if doc.similarity >= SIMILARITY_THRESHOLD]
-    
-    if not relevant_docs:
-        # No relevant knowledge found - return default message
-        return {
-            "sql": None,
-            "results": None,
-            "answer": "I don't have specific information about that topic in my knowledge base. Please ask questions related to the available data or add relevant information to the knowledge base first.",
-            "similar_docs": [],
-            "has_relevant_knowledge": False
-        }
-
-    # Format context from similar documents
-    context = "\n\n".join(
-        f"Document (similarity: {doc.similarity:.2f}):\n{doc.content}"
-        for doc in relevant_docs
-    )
     
     # Format chat history if provided
     history_context = ""
@@ -229,15 +119,14 @@ def process_chat_query(body: ChatQuery) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Failed to load schema: {str(e)}")
 
     sql_prompt = (
-        "You are a helpful assistant that writes precise PostgreSQL SQL queries.\n"
-        "Given the following database schema, write ONE SELECT query that best answers the user's question.\n"
-        "Consider the following relevant context from similar documents:\n\n"
-        f"{context}\n\n"
+        "You are a helpful Netflix database assistant that writes precise PostgreSQL SQL queries.\n"
+        "Given the following Netflix database schema, write ONE SELECT query that best answers the user's question.\n"
         f"{history_context}\n\n"
         "- Only output the SQL.\n"
         "- Do not include explanations or code fences.\n"
         "- Use valid PostgreSQL syntax and correct table/column names.\n"
-        "- Limit results to 50 rows unless the question asks otherwise.\n\n"
+        "- Limit results to 50 rows unless the question asks otherwise.\n"
+        "- Focus on Netflix content, shows, movies, ratings, genres, and user data.\n\n"
         f"SCHEMA:\n{schema_ddl}\n\n"
         f"QUESTION: {user_query}\n"
     )
@@ -261,8 +150,9 @@ def process_chat_query(body: ChatQuery) -> Dict[str, Any]:
     # Ask LLM to summarize/answer using the result rows
     try:
         answer_prompt = (
-            "You are a helpful analyst. Given the user's question and SQL query results, "
-            "write a concise, accurate answer. If the results are tabular, summarize key findings.\n"
+            "You are a helpful Netflix data analyst. Given the user's question and SQL query results, "
+            "write a concise, accurate answer about Netflix content, shows, movies, or user data. "
+            "If the results are tabular, summarize key findings in an engaging way.\n"
             "Consider the conversation history to provide contextually relevant responses.\n\n"
             f"QUESTION: {user_query}\n\n"
             f"{history_context}\n\n"
@@ -278,16 +168,7 @@ def process_chat_query(body: ChatQuery) -> Dict[str, Any]:
     return {
         "sql": sql,
         "results": result_text,
-        "answer": answer_text,
-        "similar_docs": [
-            {
-                "content": doc.content,
-                "metadata": doc.metadata,
-                "similarity": doc.similarity
-            }
-            for doc in relevant_docs
-        ],
-        "has_relevant_knowledge": True
+        "answer": answer_text
     }
 
 if __name__ == "__main__":
